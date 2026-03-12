@@ -17,12 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
@@ -90,10 +84,14 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        # PyTorch SDPA expects shapes: (Batch, Num_Heads, Seq_Len, Head_Dim)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        # Use native attention - this is highly optimized for CPU via AVX/OpenMP
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
 
 
 class MLP(nn.Module):
@@ -302,7 +300,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +310,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -435,12 +431,12 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+TOTAL_BATCH_SIZE = 2**14 # ~16K tokens per optimizer step
+EMBEDDING_LR = 0.4      # learning rate for token embeddings (Adam), 0.6 -> 0.2 -> 0.4
+UNEMBEDDING_LR = 0.003  # learning rate for lm_head (Adam), 0.004 -> 0.002 -> 0.003
+MATRIX_LR = 0.03        # learning rate for matrix parameters (Muon), 0.04 -> 0.02 -> 0.03
+SCALAR_LR = 0.4         # learning rate for per-layer scalars (Adam), 0.5 -> 0.25 -> 0.4
+WEIGHT_DECAY = 0.1      # cautious weight decay for Muon, 0.2 -> 0.1
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
@@ -448,7 +444,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 8  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,11 +452,9 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+device = torch.device("cpu")
+autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -479,7 +473,7 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
+with torch.device("cpu"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
@@ -504,8 +498,6 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
-
-model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -541,7 +533,6 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -571,7 +562,6 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
 
@@ -584,7 +574,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 0
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,8 +605,8 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = 0.0
+peak_vram_mb = 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
@@ -628,3 +618,41 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# ---------------------------------------------------------------------------
+# Save & Generate
+# ---------------------------------------------------------------------------
+print("\nSaving model...")
+torch.save(model.state_dict(), "model_8_layer.pt")
+
+print("\nGenerating sample text...")
+model.eval()
+context_text = "The universe is"
+# encode context with End/Beginning of sequence token
+input_ids = tokenizer.encode(context_text, prepend=tokenizer.bos_token_id)
+input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+
+num_generate = 120
+print(f"Starting generation of {num_generate} tokens (this might take a few seconds)...")
+with torch.no_grad():
+    for _ in range(num_generate):
+        # crop context to MAX_SEQ_LEN if it gets too long
+        idx_cond = input_tensor if input_tensor.size(1) <= MAX_SEQ_LEN else input_tensor[:, -MAX_SEQ_LEN:]
+
+        with autocast_ctx:
+            logits = model(idx_cond)
+
+        # focus only on the last time step
+        logits = logits[:, -1, :] # (Batch, Vocab)
+        probs = F.softmax(logits, dim=-1)
+
+        # sample the next token from the probability distribution
+        idx_next = torch.multinomial(probs, num_samples=1)
+
+        # append the new token to the sequence
+        input_tensor = torch.cat((input_tensor, idx_next), dim=1)
+
+generated_ids = input_tensor[0].tolist()
+print("\n--- Generated Text ---")
+print(tokenizer.decode(generated_ids))
+print("----------------------")
