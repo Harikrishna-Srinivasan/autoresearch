@@ -12,7 +12,7 @@ This version is optimized for **CPU-only** training, making it accessible even i
 The repository is designed to be beginner-friendly. You can use either `uv` (recommended) or `pip`.
 
 ### Requirements
-- **Python 3.10+**
+- **Python 3.10 to 3.12** (tested with 3.10)
 - (Optional) [uv](https://docs.astral.sh/uv/) for faster dependency management.
 
 ### Installation
