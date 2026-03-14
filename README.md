@@ -3,7 +3,7 @@
 This is an experiment to have an AI agent do its own research. It gives a small but real LLM training setup to an AI researcher and lets it experiment autonomously. The agent modifies the code, trains for a fixed time budget, checks if the result improved, and repeats.
 
 This project is a fork and adaptation of the `autoresearch` repository, 
-originally created and developed by (Andrej Karpathy)[https://github.com/karpathy].
+originally created and developed by [Andrej Karpathy](https://github.com/karpathy).
 
 This version is optimized for **CPU-only** training, making it accessible even if you don't have a high-end NVIDIA GPU.
 
